@@ -123,26 +123,46 @@ class WindowProgressTable:
 			self.boxes[row][col].config(state=tk.DISABLED)
 	
 	def update_shelf_objects(self, shelf_col, object_list):
-		"""Update all objects for a specific shelf column."""
+		"""Update objects for a specific shelf column - add new objects to next available rows."""
 		# Ensure we don't exceed available columns
 		if shelf_col >= self.col_count:
 			print(f"Warning: Trying to update shelf {shelf_col}, but only {self.col_count} columns available")
 			return
-			
-		# Clear all object boxes for this shelf
-		for row in range(len(self.boxes)):
-			self.change_box_text(row, shelf_col, "---")
-			self.change_box_color(row, shelf_col, "white")
 		
-		# Fill with detected objects
-		for idx, (name, count) in enumerate(object_list):
-			if idx < len(self.boxes):
-				self.change_box_text(idx, shelf_col, f"{name}: {count}")
-				self.change_box_color(idx, shelf_col, "lightgreen")
+		# Track which objects we already have in this shelf
+		existing_objects = set()
+		for row in range(len(self.boxes)):
+			current_text = self.boxes[row][shelf_col].get(1.0, tk.END).strip()
+			if current_text and current_text != "---" and ":" in current_text:
+				object_name = current_text.split(":")[0].strip()
+				existing_objects.add(object_name)
+		
+		# Add new objects to next available rows
+		next_available_row = 0
+		for row in range(len(self.boxes)):
+			current_text = self.boxes[row][shelf_col].get(1.0, tk.END).strip()
+			if current_text and current_text != "---" and current_text != f"Object {row+1}":
+				next_available_row = row + 1
+			else:
+				break
+		
+		# Add new objects that we don't already have
+		objects_added = 0
+		for name, count in object_list:
+			if name not in existing_objects and next_available_row < len(self.boxes):
+				self.change_box_text(next_available_row, shelf_col, f"{name}: {count}")
+				self.change_box_color(next_available_row, shelf_col, "lightgreen")
+				existing_objects.add(name)
+				next_available_row += 1
+				objects_added += 1
+				print(f"Added new object '{name}' to shelf {shelf_col}, row {next_available_row-1}")
 		
 		# Update shelf status
-		self.shelf_status[shelf_col] = "objects"
-		print(f"Updated shelf {shelf_col} with {len(object_list)} objects")
+		if len(existing_objects) > 0:
+			self.shelf_status[shelf_col] = "objects"
+		
+		total_objects = len(existing_objects)
+		print(f"Shelf {shelf_col} now has {total_objects} total objects ({objects_added} new objects added)")
 	
 	def update_shelf_qr(self, shelf_col, qr_text):
 		"""Update QR code for a specific shelf."""
@@ -319,14 +339,15 @@ class WarehouseExplore(Node):
 		# --- Orbital Movement for Shelf Detection ---
 		self.orbital_mode = False
 		self.orbital_center = None  # Center point around which to orbit
-		self.orbital_radius = 1.5  # Meters from shelf center
+		self.orbital_radius = 2.0  # Meters from shelf center (increased for better view)
 		self.orbital_angle = 0.0  # Current orbital angle
-		self.orbital_speed = 0.15  # Linear speed during orbital movement
-		self.orbital_angular_speed = 0.3  # Angular speed during orbital movement
+		self.orbital_speed = 0.2  # Linear speed during orbital movement (slightly increased)
+		self.orbital_angular_speed = 0.25  # Angular speed during orbital movement (slightly slower for better scanning)
 		self.orbital_start_time = None
-		self.max_orbital_time = 45.0  # Maximum time for orbital movement
+		self.max_orbital_time = 60.0  # Maximum time for orbital movement (increased)
 		self.expected_objects_count = 6  # Expected objects on a shelf
 		self.orbital_detection_timer = None
+		self.orbital_direction = 1  # 1 for counter-clockwise, -1 for clockwise
 		
 		# --- NEW Shelf Detection State (Objects FIRST, then QR) ---
 		self.objects_detected = False
@@ -334,11 +355,16 @@ class WarehouseExplore(Node):
 		self.objects_detection_time = None
 		self.qr_scanning_enabled = False  # Only scan QR after objects detected
 		self.current_shelf_qr = None
-		self.objects_timeout = 15.0  # Seconds to wait for stable object detection
-		self.qr_timeout = 10.0  # Seconds to wait for QR after objects detected
+		self.objects_timeout = 30.0  # Seconds to wait for stable object detection (increased)
+		self.qr_timeout = 20.0  # Seconds to wait for QR after objects detected (increased)
 		self.min_objects_for_shelf = 1  # Minimum objects to consider it a valid shelf
 		self.objects_stable_count = 0  # Count of consecutive stable object detections
 		self.required_stable_detections = 3  # Required stable detections before enabling QR
+		
+		# --- Progress Tracking for Persistence ---
+		self.last_object_count = 0  # Track if we're making progress
+		self.objects_progress_time = None  # Last time we made progress
+		self.max_no_progress_time = 60.0  # Max time without progress before giving up
 		
 		# Create a timer for periodic status updates
 		self.status_timer = self.create_timer(5.0, self.periodic_status_update)
@@ -614,6 +640,7 @@ class WarehouseExplore(Node):
 	def shelf_objects_callback(self, message):
 		"""Callback function to handle shelf objects updates.
 		NEW WORKFLOW: Objects detected FIRST, then QR scanning enabled.
+		IMPROVED: Incremental object detection with immediate GUI updates.
 
 		Args:
 			message: ROS2 message containing shelf objects data.
@@ -630,33 +657,71 @@ class WarehouseExplore(Node):
 			# Check if objects are sufficient for a shelf
 			if len(message.object_name) >= self.min_objects_for_shelf:
 				
-				# Check if objects are stable (same as previous detection)
-				if self._are_objects_stable(message):
-					self.objects_stable_count += 1
-					self.get_logger().info(f"📦 Stable objects detected ({self.objects_stable_count}/{self.required_stable_detections}): {len(message.object_name)} items")
-					
-					# If objects are stable for required count, enable QR scanning
-					if self.objects_stable_count >= self.required_stable_detections and not self.objects_detected:
-						self._enable_qr_scanning_after_objects(message)
-					
-				else:
-					# Objects changed, reset stability counter
-					self.objects_stable_count = 1
+				# Check if we have new objects compared to current state
+				has_new_objects, new_object_names = self._check_for_new_objects(message)
+				
+				if has_new_objects:
+					# Update current objects with new detections
 					self.current_objects = message
+					self.objects_stable_count = 1  # Reset stability for new objects
+					
 					obj_list = [f"{name}({count})" for name, count in zip(message.object_name, message.object_count)]
-					self.get_logger().info(f"📦 New objects detected (resetting stability): {', '.join(obj_list)}")
+					self.get_logger().info(f"📦 Objects detected ({len(message.object_name)} total): {', '.join(obj_list)}")
+					
+					# Immediately update GUI with new objects during orbital movement
+					if PROGRESS_TABLE_GUI and box_app is not None:
+						try:
+							current_shelf_col = box_app.get_current_shelf_column()
+							object_pairs = list(zip(message.object_name, message.object_count))
+							box_app.update_shelf_objects(current_shelf_col, object_pairs)
+							self.get_logger().info(f"📊 Updated GUI shelf {current_shelf_col} with {len(message.object_name)} objects")
+						except Exception as e:
+							self.get_logger().warning(f"GUI update failed: {e}")
+				
+				# Check if objects are stable (same as previous detection)
+				elif self._are_objects_stable(message):
+					self.objects_stable_count += 1
+					self.get_logger().debug(f"📦 Stable objects count: {self.objects_stable_count}/{self.required_stable_detections}")
+				
+				# If objects are stable for required count OR we have enough objects, enable QR scanning
+				if ((self.objects_stable_count >= self.required_stable_detections or 
+					 len(message.object_name) >= self.expected_objects_count) and 
+					not self.objects_detected):
+					self._enable_qr_scanning_after_objects(message)
 				
 				# SLOW DOWN movement when objects are being detected (but not full focus yet)
-				if not self.shelf_focus_mode:
+				elif not self.shelf_focus_mode:
 					self._slow_down_for_potential_shelf()
 				
 			else:
 				self.get_logger().debug(f"📦 Too few objects ({len(message.object_name)}) - need at least {self.min_objects_for_shelf}")
 		else:
-			# No objects detected, reset state
-			if self.objects_detected or self.qr_scanning_enabled:
+			# No objects detected - only reset if we haven't entered shelf focus mode
+			if not self.shelf_focus_mode and (self.objects_detected or self.qr_scanning_enabled):
 				self.get_logger().info("📦 No objects detected - resetting detection state")
 				self._reset_detection_state()
+
+	def _check_for_new_objects(self, new_message):
+		"""Check if the new message contains objects we haven't seen before.
+		
+		Returns:
+			tuple: (has_new_objects, list_of_new_object_names)
+		"""
+		if self.current_objects is None:
+			# First time seeing objects
+			return True, list(new_message.object_name)
+		
+		# Get current object names
+		current_object_names = set(self.current_objects.object_name)
+		new_object_names = set(new_message.object_name)
+		
+		# Check if we have more objects or different objects
+		has_new_objects = (len(new_message.object_name) > len(self.current_objects.object_name) or
+						  not new_object_names.issubset(current_object_names))
+		
+		newly_found = list(new_object_names - current_object_names)
+		
+		return has_new_objects, newly_found
 
 	def _are_objects_stable(self, new_message):
 		"""Check if the detected objects are the same as previous detection."""
@@ -792,17 +857,30 @@ class WarehouseExplore(Node):
 		if not self.orbital_mode or self.orbital_center is None:
 			return
 			
-		# Check timeout
 		current_time = self.get_clock().now()
-		if (self.orbital_start_time and 
-			(current_time - self.orbital_start_time).nanoseconds / 1e9 > self.max_orbital_time):
-			self.get_logger().warning(f"⏰ Orbital movement timeout after {self.max_orbital_time}s")
-			self._complete_orbital_detection()
-			return
+		current_object_count = 0
+		if self.current_objects and self.current_objects.object_name:
+			current_object_count = len(self.current_objects.object_name)
+		
+		# Check timeout only if we're not making progress
+		time_since_start = (current_time - self.orbital_start_time).nanoseconds / 1e9 if self.orbital_start_time else 0
+		if time_since_start > self.max_orbital_time:
+			# If we have decent progress (more than half expected objects), extend time
+			if current_object_count >= self.expected_objects_count // 2:
+				extended_time = self.max_orbital_time + 30.0  # Extra 30 seconds
+				if time_since_start > extended_time:
+					self.get_logger().warning(f"⏰ Extended orbital timeout after {extended_time}s with {current_object_count} objects")
+					self._complete_orbital_detection()
+					return
+				else:
+					self.get_logger().info(f"🕘 Extending orbital time - have {current_object_count}/{self.expected_objects_count} objects")
+			else:
+				self.get_logger().warning(f"⏰ Orbital movement timeout after {self.max_orbital_time}s with only {current_object_count} objects")
+				self._complete_orbital_detection()
+				return
 			
 		# Check if we have enough objects detected
-		if (self.current_objects and 
-			len(self.current_objects.object_name) >= self.expected_objects_count):
+		if current_object_count >= self.expected_objects_count:
 			self.get_logger().info(f"✅ All {self.expected_objects_count} objects detected! Stopping orbital movement")
 			self._complete_orbital_detection()
 			return
@@ -928,6 +1006,10 @@ class WarehouseExplore(Node):
 		self.current_shelf_qr = None
 		self.objects_stable_count = 0
 		
+		# Reset progress tracking
+		self.last_object_count = 0
+		self.objects_progress_time = None
+		
 		# Stop orbital movement if active
 		if self.orbital_mode:
 			self._stop_orbital_movement()
@@ -942,24 +1024,50 @@ class WarehouseExplore(Node):
 		"""Periodic check to handle timeouts in the new detection workflow."""
 		current_time = self.get_clock().now()
 		
+		# Track progress in object detection
+		current_object_count = 0
+		if self.current_objects and self.current_objects.object_name:
+			current_object_count = len(self.current_objects.object_name)
+		
+		# Check if we're making progress (detecting more objects)
+		if current_object_count > self.last_object_count:
+			self.last_object_count = current_object_count
+			self.objects_progress_time = current_time
+			self.get_logger().info(f"📈 Progress! Now have {current_object_count} objects detected")
+		
+		# Initialize progress time if not set
+		if self.objects_progress_time is None:
+			self.objects_progress_time = current_time
+		
 		# Check shelf focus mode timeout (but not during orbital movement which has its own timeout)
 		if (self.shelf_focus_mode and self.focus_start_time and not self.orbital_mode and
 			(current_time - self.focus_start_time).nanoseconds / 1e9 > self.max_focus_time):
 			self.get_logger().warning(f"⏰ Shelf Focus Timeout: Focused for {self.max_focus_time}s, resuming exploration")
 			self._reset_detection_state()  # This will also exit focus mode
 		
-		# Check timeout for objects detection
+		# Check timeout for QR detection (only if we have enough objects)
 		if (self.objects_detected and self.objects_detection_time and not self.current_shelf_qr and
+			current_object_count >= self.expected_objects_count and
 			(current_time - self.objects_detection_time).nanoseconds / 1e9 > self.qr_timeout):
 			obj_list = [f"{name}({count})" for name, count in zip(self.current_objects.object_name, self.current_objects.object_count)]
-			self.get_logger().warning(f"⏰ QR Timeout: Objects detected [{', '.join(obj_list)}] but no QR code found within {self.qr_timeout}s. Resetting.")
+			self.get_logger().warning(f"⏰ QR Timeout: {current_object_count} objects detected [{', '.join(obj_list)}] but no QR code found within {self.qr_timeout}s. Resetting.")
 			self._reset_detection_state()
 		
-		# Check timeout for object stability
-		if (self.objects_stable_count > 0 and not self.objects_detected and self.last_object_detection_time and
-			(current_time - self.last_object_detection_time).nanoseconds / 1e9 > self.objects_timeout):
-			self.get_logger().warning(f"⏰ Objects Timeout: No stable objects detected within {self.objects_timeout}s. Resetting.")
-			self._reset_detection_state()
+		# Check for lack of progress timeout (more lenient - only if NO progress for a long time)
+		time_since_progress = (current_time - self.objects_progress_time).nanoseconds / 1e9
+		if (self.objects_stable_count > 0 and not self.objects_detected and
+			time_since_progress > self.max_no_progress_time):
+			self.get_logger().warning(f"⏰ No Progress Timeout: No object detection progress for {self.max_no_progress_time}s. Current count: {current_object_count}")
+			# Only reset if we have very few objects or no progress at all
+			if current_object_count < 3:
+				self._reset_detection_state()
+			else:
+				self.get_logger().info(f"🎯 But we have {current_object_count} objects, continuing orbital movement...")
+		
+		# If we're in orbital mode and have all objects, complete detection
+		if (self.orbital_mode and current_object_count >= self.expected_objects_count):
+			self.get_logger().info(f"✅ Target achieved! Found all {self.expected_objects_count} objects")
+			self._complete_orbital_detection()
 
 	def rover_move_manual_mode(self, speed, turn):
 		"""Operates the rover in manual mode by publishing on /cerebri/in/joy.
@@ -1271,9 +1379,16 @@ class WarehouseExplore(Node):
 		movement_status = "PAUSED" if self.movement_paused else "Active"
 		
 		orbital_info = ""
-		if self.orbital_mode and self.current_objects:
-			current_obj_count = len(self.current_objects.object_name)
-			orbital_info = f", Orbital Objects: {current_obj_count}/{self.expected_objects_count}"
+		if self.orbital_mode:
+			current_obj_count = 0
+			if self.current_objects and self.current_objects.object_name:
+				current_obj_count = len(self.current_objects.object_name)
+				obj_names = ", ".join(self.current_objects.object_name[:3])  # Show first 3 objects
+				if current_obj_count > 3:
+					obj_names += f" (+{current_obj_count-3} more)"
+				orbital_info = f", Orbital: {current_obj_count}/{self.expected_objects_count} [{obj_names}]"
+			else:
+				orbital_info = f", Orbital: {current_obj_count}/{self.expected_objects_count} [searching...]"
 		
 		status_msg = (
 			f"🤖 Status - Mode: {focus_status}, "
