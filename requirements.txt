@@ -1,0 +1,7 @@
+# ROS2 Warehouse Exploration Node Dependencies
+rclpy
+numpy>=1.21.0
+opencv-python>=4.5.0
+scipy>=1.7.0
+scikit-learn>=1.0.0
+# Note: ROS2 message packages (sensor_msgs, geometry_msgs, etc.) are typically installed via rosdep
