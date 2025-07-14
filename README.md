@@ -118,12 +118,15 @@ ros2 run <package_name> warehouse_explore.py --ros-args -p shelf_count:=5 -p ini
 ## QR Code & Object Detection
 
 ### Shelf Detection Workflow
-The node follows a strict detection sequence to ensure data integrity:
+The system follows a strict detection sequence to ensure data integrity:
 
-1. **Shelf Detection First**: QR code detection indicates shelf presence
-2. **Object Processing**: Objects are only processed after shelf confirmation
-3. **Data Association**: Objects are linked with the shelf's QR code
-4. **Publication**: Complete shelf data is published only when both are confirmed
+1. **🔍 Object Detection First**: AI model detects objects and waits for stability (3 consecutive stable detections)
+2. **✅ Object Confirmation**: Once objects are stable, QR code scanning is enabled
+3. **📱 QR Code Scanning**: System scans for QR codes only after object confirmation
+4. **🔗 Data Association**: QR code is linked with the confirmed objects
+5. **📤 Publication**: Complete shelf data is published when both objects and QR are confirmed
+
+**NEW: Objects → QR → Association (not QR → Objects)**
 
 ### QR Code Processing
 - Uses OpenCV's built-in QR detector (no libzbar dependency)
@@ -139,9 +142,16 @@ The node follows a strict detection sequence to ensure data integrity:
 - Updates GUI table in real-time
 
 ### Detection States
-- **No Shelf**: Waiting for QR code detection
-- **Shelf Detected**: QR code found, waiting for or processing objects
-- **Processing Complete**: Shelf data published, ready for next shelf
+- **🔍 Waiting for Objects**: Initial state, scanning for objects
+- **📦 Objects Stabilizing**: Objects detected, waiting for stability (3 consecutive detections)
+- **✅ Objects Confirmed**: Objects stable, QR scanning enabled
+- **📱 QR Scanning**: Looking for QR code to associate with objects
+- **🎉 Shelf Complete**: Both objects and QR confirmed, data published
+- **🔄 Reset**: Ready for next shelf
+
+### Testing Mode
+- **🧪 Dummy Mode**: If YOLO model is not available, generates random test objects every 2 seconds
+- **📝 Real Mode**: Requires `yolov5n-int8.tflite` model file for actual object detection
 
 ## Object Detection Capabilities
 
@@ -168,11 +178,16 @@ The system filters detected objects to focus on items typically found on warehou
 
 ## GUI Features
 
-The optional GUI provides:
-- **Object Display**: Shows detected objects per shelf
-- **QR Code Display**: Current QR code for each shelf
-- **Color Coding**: Visual status indicators
-- **Real-time Updates**: Live data from exploration
+The enhanced GUI provides:
+- **📋 Header Row**: Shelf numbering (Shelf 1, Shelf 2, etc.)
+- **📦 Object Rows**: Up to 8 object slots per shelf (expandable layout)
+- **📱 QR Row**: QR code display at bottom
+- **🎨 Color Coding**: 
+  - Green = Objects detected
+  - Blue = QR code confirmed  
+  - Yellow = QR waiting
+  - White = Empty slots
+- **📊 Real-time Updates**: Live data from both detection nodes
 
 ## Error Handling & Recovery
 
@@ -203,18 +218,48 @@ rosdep install --from-paths . --ignore-src -r -y
 The system requires these model files to be available:
 
 1. **YOLO Model**: `yolov5n-int8.tflite`
-   - Place in: `share/ament_index/resource_index/`
-   - Alternative locations: `~/yolov5n-int8.tflite` or working directory
+   - **Download**: Get YOLOv5n quantized model from Ultralytics or convert from PyTorch
+   - **Size**: ~3.8MB (int8 quantized version)
+   - **Placement options**:
+     - `~/yolov5n-int8.tflite` (recommended for testing)
+     - `./yolov5n-int8.tflite` (in workspace)
+     - `share/ament_index/resource_index/yolov5n-int8.tflite` (in package)
+   - **Alternative**: System will use dummy mode if model not found
 
 2. **COCO Labels**: `coco.yaml`
-   - Place in: `share/ament_index/resource_index/`
-   - Alternative locations: `~/coco.yaml` or working directory
-   - Contains COCO class names for object detection
+   - **Auto-generated**: Default COCO class names are built-in
+   - **Optional**: Place custom labels at `~/coco.yaml` if needed
+   - **Format**: YAML file with 'names' key containing class list
 
 ### Hardware Requirements
 - **Minimum**: CPU-only inference (slower but functional)
 - **Recommended**: GPU-accelerated inference for real-time performance
 - **Optimal**: NavQPlus with NPU support for maximum efficiency
+
+## Quick Testing
+
+### Without YOLO Model (Dummy Mode)
+```bash
+# Start both nodes (will use dummy objects if model not found)
+ros2 launch <package_name> warehouse_system_launch.py
+
+# You should see:
+# - Object Recognizer: "🧪 DUMMY: Generated X objects: ..."
+# - Warehouse Explorer: "📦 Stable objects detected..."  
+# - GUI: Objects appear, then QR scanning enables
+```
+
+### With YOLO Model (Real Mode)
+```bash
+# 1. Download YOLOv5n model (place in home directory)
+# 2. Launch system
+ros2 launch <package_name> warehouse_system_launch.py
+
+# You should see:
+# - Object Recognizer: "🤖 Loaded YOLO model from..."
+# - Real object detection from camera feed
+# - Objects → QR workflow as designed
+```
 
 ## Code Structure
 

@@ -63,35 +63,81 @@ PROGRESS_TABLE_GUI = True
 class WindowProgressTable:
 	def __init__(self, root, shelf_count):
 		self.root = root
-		self.root.title("Shelf Objects & QR Link")
+		self.root.title("Warehouse Shelf Objects & QR Link")
 		self.root.attributes("-topmost", True)
 
-		self.row_count = 2
+		# Dynamic layout to accommodate up to 8 objects per shelf
+		self.max_objects_per_shelf = 8
+		self.row_count = self.max_objects_per_shelf + 1  # Objects + 1 row for QR
 		self.col_count = shelf_count
 
 		self.boxes = []
-		for row in range(self.row_count):
+		
+		# Create header labels
+		for col in range(self.col_count):
+			header = tk.Label(root, text=f"Shelf {col+1}", font=("Helvetica", 12, "bold"), 
+							 bg="lightgray", relief="solid", borderwidth=1)
+			header.grid(row=0, column=col, padx=2, pady=2, sticky="nsew")
+		
+		# Create object boxes (rows 1-8 for objects)
+		for row in range(1, self.max_objects_per_shelf + 1):
 			row_boxes = []
 			for col in range(self.col_count):
-				box = tk.Text(root, width=10, height=3, wrap=tk.WORD, borderwidth=1,
-					      relief="solid", font=("Helvetica", 14))
-				box.insert(tk.END, "NULL")
-				box.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
+				box = tk.Text(root, width=12, height=2, wrap=tk.WORD, borderwidth=1,
+					      relief="solid", font=("Helvetica", 10))
+				box.insert(tk.END, f"Object {row}")
+				box.config(state=tk.DISABLED)  # Read-only initially
+				box.grid(row=row, column=col, padx=2, pady=1, sticky="nsew")
 				row_boxes.append(box)
 			self.boxes.append(row_boxes)
+		
+		# Create QR row (last row)
+		self.qr_boxes = []
+		for col in range(self.col_count):
+			qr_box = tk.Text(root, width=12, height=2, wrap=tk.WORD, borderwidth=1,
+						    relief="solid", font=("Helvetica", 10, "bold"))
+			qr_box.insert(tk.END, "QR: Waiting...")
+			qr_box.config(state=tk.DISABLED, bg="lightyellow")
+			qr_box.grid(row=self.max_objects_per_shelf + 1, column=col, padx=2, pady=2, sticky="nsew")
+			self.qr_boxes.append(qr_box)
 
-		# Make the grid layout responsive.
-		for row in range(self.row_count):
+		# Make the grid layout responsive
+		for row in range(self.max_objects_per_shelf + 2):  # +2 for header and QR
 			self.root.grid_rowconfigure(row, weight=1)
 		for col in range(self.col_count):
 			self.root.grid_columnconfigure(col, weight=1)
 
 	def change_box_color(self, row, col, color):
-		self.boxes[row][col].config(bg=color)
+		if row < len(self.boxes):
+			self.boxes[row][col].config(bg=color)
 
 	def change_box_text(self, row, col, text):
-		self.boxes[row][col].delete(1.0, tk.END)
-		self.boxes[row][col].insert(tk.END, text)
+		if row < len(self.boxes):
+			self.boxes[row][col].config(state=tk.NORMAL)
+			self.boxes[row][col].delete(1.0, tk.END)
+			self.boxes[row][col].insert(tk.END, text)
+			self.boxes[row][col].config(state=tk.DISABLED)
+	
+	def update_shelf_objects(self, shelf_col, object_list):
+		"""Update all objects for a specific shelf column."""
+		# Clear all object boxes for this shelf
+		for row in range(len(self.boxes)):
+			self.change_box_text(row, shelf_col, "---")
+			self.change_box_color(row, shelf_col, "white")
+		
+		# Fill with detected objects
+		for idx, (name, count) in enumerate(object_list):
+			if idx < len(self.boxes):
+				self.change_box_text(idx, shelf_col, f"{name}: {count}")
+				self.change_box_color(idx, shelf_col, "lightgreen")
+	
+	def update_shelf_qr(self, shelf_col, qr_text):
+		"""Update QR code for a specific shelf."""
+		if shelf_col < len(self.qr_boxes):
+			self.qr_boxes[shelf_col].config(state=tk.NORMAL)
+			self.qr_boxes[shelf_col].delete(1.0, tk.END)
+			self.qr_boxes[shelf_col].insert(tk.END, f"QR: {qr_text}")
+			self.qr_boxes[shelf_col].config(state=tk.DISABLED, bg="lightblue")
 
 box_app = None
 def run_gui(shelf_count):
@@ -231,19 +277,23 @@ class WarehouseExplore(Node):
 		self.max_exploration_attempts = 50
 		self.exploration_attempts = 0
 		
-		# --- Shelf Detection State ---
-		self.shelf_detected = False
+		# --- NEW Shelf Detection State (Objects FIRST, then QR) ---
+		self.objects_detected = False
+		self.current_objects = None
+		self.objects_detection_time = None
+		self.qr_scanning_enabled = False  # Only scan QR after objects detected
 		self.current_shelf_qr = None
-		self.shelf_detection_time = None
-		self.pending_objects = None  # Store objects until shelf is confirmed
-		self.shelf_detection_timeout = 5.0  # Seconds to wait for objects after shelf detection
-		self.object_detection_timeout = 10.0  # Seconds to wait for shelf confirmation after objects
+		self.objects_timeout = 15.0  # Seconds to wait for stable object detection
+		self.qr_timeout = 10.0  # Seconds to wait for QR after objects detected
+		self.min_objects_for_shelf = 1  # Minimum objects to consider it a valid shelf
+		self.objects_stable_count = 0  # Count of consecutive stable object detections
+		self.required_stable_detections = 3  # Required stable detections before enabling QR
 		
 		# Create a timer for periodic status updates
 		self.status_timer = self.create_timer(5.0, self.periodic_status_update)
 		
-		# Create a timer to check for shelf-object association
-		self.shelf_object_timer = self.create_timer(1.0, self.check_shelf_object_association)
+		# Create a timer to check for object-qr association
+		self.detection_monitor_timer = self.create_timer(1.0, self.check_detection_workflow)
 
 
 
@@ -427,13 +477,17 @@ class WarehouseExplore(Node):
 					if not qr_str:
 						continue
 					qr_found = True
-					if qr_str != self.qr_code_str:
-						self.qr_code_str = qr_str
-						self.last_qr_detection_time = self.get_clock().now()
-						self.get_logger().info(f"QR code detected: {qr_str}")
-						
-						# QR code detection indicates shelf presence
-						self._detect_shelf(qr_str)
+					
+					# Only process QR codes if we have detected objects first
+					if self.qr_scanning_enabled and self.objects_detected:
+						if qr_str != self.qr_code_str:
+							self.qr_code_str = qr_str
+							self.current_shelf_qr = qr_str
+							self.last_qr_detection_time = self.get_clock().now()
+							self.get_logger().info(f"🔗 QR code detected AFTER objects: {qr_str}")
+							
+							# Process complete shelf now that we have both objects and QR
+							self._process_complete_shelf()
 
 						# Draw bounding box around the QR code for visual debugging.
 						pts = pts.astype(int).reshape(-1, 2)
@@ -446,11 +500,16 @@ class WarehouseExplore(Node):
 						cv2.putText(image, qr_str, pt_text, cv2.FONT_HERSHEY_SIMPLEX,
 							0.5, (0, 255, 0), 2, cv2.LINE_AA)
 					else:
-						# Update timestamp even for same QR code
-						self.last_qr_detection_time = self.get_clock().now()
-						# Refresh shelf detection for same QR
-						if not self.shelf_detected or self.current_shelf_qr != qr_str:
-							self._detect_shelf(qr_str)
+						# Draw QR but indicate it's not being processed yet
+						pts = pts.astype(int).reshape(-1, 2)
+						for i in range(len(pts)):
+							pt1 = tuple(pts[i])
+							pt2 = tuple(pts[(i + 1) % len(pts)])
+							cv2.line(image, pt1, pt2, (0, 0, 255), 2)  # Red = not ready
+						pt_text = tuple(pts[0])
+						status = "WAITING FOR OBJECTS" if not self.objects_detected else "QR READY"
+						cv2.putText(image, f"{qr_str} ({status})", pt_text, cv2.FONT_HERSHEY_SIMPLEX,
+							0.4, (0, 0, 255), 2, cv2.LINE_AA)
 		except Exception as e:
 			self.get_logger().error(f"Error in QR detection: {e}")
 
@@ -498,7 +557,7 @@ class WarehouseExplore(Node):
 
 	def shelf_objects_callback(self, message):
 		"""Callback function to handle shelf objects updates.
-		Only processes objects if a shelf has been detected first.
+		NEW WORKFLOW: Objects detected FIRST, then QR scanning enabled.
 
 		Args:
 			message: ROS2 message containing shelf objects data.
@@ -508,107 +567,125 @@ class WarehouseExplore(Node):
 		"""
 		self.shelf_objects_curr = message
 		
-		# Only process if we have detected objects
+		# Process object detection (step 1 of new workflow)
 		if len(message.object_name) > 0:
 			self.last_object_detection_time = self.get_clock().now()
-			self.get_logger().info(f"Objects detected: {len(message.object_name)} items")
 			
-			# Check if we have a shelf detected first
-			if self.shelf_detected and self.current_shelf_qr:
-				self.get_logger().info(f"Processing objects for shelf with QR: {self.current_shelf_qr}")
-				self._process_shelf_objects(message)
-			else:
-				# Store objects temporarily until shelf is confirmed
-				self.pending_objects = message
-				self.get_logger().warning("Objects detected but no shelf confirmed yet. Storing objects temporarily.")
+			# Check if objects are sufficient for a shelf
+			if len(message.object_name) >= self.min_objects_for_shelf:
 				
-				# Log what objects were detected but not processed
-				obj_list = [f"{name}({count})" for name, count in zip(message.object_name, message.object_count)]
-				self.get_logger().info(f"Pending objects: {', '.join(obj_list)}")
+				# Check if objects are stable (same as previous detection)
+				if self._are_objects_stable(message):
+					self.objects_stable_count += 1
+					self.get_logger().info(f"📦 Stable objects detected ({self.objects_stable_count}/{self.required_stable_detections}): {len(message.object_name)} items")
+					
+					# If objects are stable for required count, enable QR scanning
+					if self.objects_stable_count >= self.required_stable_detections and not self.objects_detected:
+						self._enable_qr_scanning_after_objects(message)
+					
+				else:
+					# Objects changed, reset stability counter
+					self.objects_stable_count = 1
+					self.current_objects = message
+					obj_list = [f"{name}({count})" for name, count in zip(message.object_name, message.object_count)]
+					self.get_logger().info(f"📦 New objects detected (resetting stability): {', '.join(obj_list)}")
+				
+			else:
+				self.get_logger().debug(f"📦 Too few objects ({len(message.object_name)}) - need at least {self.min_objects_for_shelf}")
+		else:
+			# No objects detected, reset state
+			if self.objects_detected or self.qr_scanning_enabled:
+				self.get_logger().info("📦 No objects detected - resetting detection state")
+				self._reset_detection_state()
 
-	def _detect_shelf(self, qr_code):
-		"""Detects a shelf based on QR code presence.
+	def _are_objects_stable(self, new_message):
+		"""Check if the detected objects are the same as previous detection."""
+		if self.current_objects is None:
+			return False
 		
-		Args:
-			qr_code: The detected QR code string
-		"""
-		self.shelf_detected = True
-		self.current_shelf_qr = qr_code
-		self.shelf_detection_time = self.get_clock().now()
+		# Compare object names and counts
+		if len(new_message.object_name) != len(self.current_objects.object_name):
+			return False
 		
-		self.get_logger().info(f"SHELF DETECTED with QR code: {qr_code}")
+		# Create sorted lists for comparison
+		new_objects = sorted(zip(new_message.object_name, new_message.object_count))
+		current_objects = sorted(zip(self.current_objects.object_name, self.current_objects.object_count))
 		
-		# If we have pending objects, process them now
-		if self.pending_objects is not None:
-			self.get_logger().info("Processing previously detected objects now that shelf is confirmed")
-			self._process_shelf_objects(self.pending_objects)
-			self.pending_objects = None
-	
-	def _process_shelf_objects(self, objects_message):
-		"""Processes shelf objects after shelf has been confirmed.
+		return new_objects == current_objects
+
+	def _enable_qr_scanning_after_objects(self, objects_message):
+		"""Enable QR scanning after stable object detection."""
+		self.objects_detected = True
+		self.current_objects = objects_message
+		self.objects_detection_time = self.get_clock().now()
+		self.qr_scanning_enabled = True
 		
-		Args:
-			objects_message: WarehouseShelf message with object data
-		"""
-		# Create shelf data message for evaluation with current QR code
+		obj_list = [f"{name}({count})" for name, count in zip(objects_message.object_name, objects_message.object_count)]
+		self.get_logger().info(f"✅ OBJECTS CONFIRMED: {', '.join(obj_list)} - QR scanning now ENABLED")
+		
+		# Update GUI with detected objects
+		if PROGRESS_TABLE_GUI and box_app is not None:
+			try:
+				object_pairs = list(zip(objects_message.object_name, objects_message.object_count))
+				box_app.update_shelf_objects(self.table_col_count, object_pairs)
+			except Exception as e:
+				self.get_logger().warning(f"GUI update failed: {e}")
+
+	def _process_complete_shelf(self):
+		"""Process complete shelf when both objects and QR are available."""
+		if not self.objects_detected or not self.current_shelf_qr or not self.current_objects:
+			self.get_logger().warning("⚠️  Cannot process shelf - missing objects or QR")
+			return
+		
+		# Create shelf data message for evaluation
 		shelf_data_message = WarehouseShelf()
-		shelf_data_message.object_name = objects_message.object_name
-		shelf_data_message.object_count = objects_message.object_count
+		shelf_data_message.object_name = self.current_objects.object_name
+		shelf_data_message.object_count = self.current_objects.object_count
 		shelf_data_message.qr_decoded = self.current_shelf_qr
 		
 		# Publish the shelf data for evaluation
 		self.publisher_shelf_data.publish(shelf_data_message)
 		
-		obj_summary = [f"{name}({count})" for name, count in zip(objects_message.object_name, objects_message.object_count)]
-		self.get_logger().info(f"✅ PUBLISHED SHELF DATA: QR='{self.current_shelf_qr}', Objects=[{', '.join(obj_summary)}]")
+		obj_summary = [f"{name}({count})" for name, count in zip(self.current_objects.object_name, self.current_objects.object_count)]
+		self.get_logger().info(f"🎉 SHELF COMPLETE: QR='{self.current_shelf_qr}', Objects=[{', '.join(obj_summary)}]")
 
-		# Update GUI table with detected objects and QR data
+		# Update GUI with QR code
 		if PROGRESS_TABLE_GUI and box_app is not None:
 			try:
-				obj_str = ""
-				for name, count in zip(objects_message.object_name, objects_message.object_count):
-					obj_str += f"{name}: {count}\n"
-
-				# Ensure we don't exceed table bounds
-				if self.table_col_count < box_app.col_count:
-					box_app.change_box_text(self.table_row_count, self.table_col_count, obj_str)
-					box_app.change_box_color(self.table_row_count, self.table_col_count, "cyan")
-					self.table_row_count += 1
-
-					box_app.change_box_text(self.table_row_count, self.table_col_count, self.current_shelf_qr)
-					box_app.change_box_color(self.table_row_count, self.table_col_count, "yellow")
-					self.table_row_count = 0
-					self.table_col_count += 1
+				box_app.update_shelf_qr(self.table_col_count, self.current_shelf_qr)
+				self.table_col_count += 1  # Move to next shelf column
 			except Exception as e:
-				self.get_logger().warning(f"GUI update failed: {e}")
+				self.get_logger().warning(f"GUI QR update failed: {e}")
 		
-		# Reset shelf detection state for next shelf
-		self._reset_shelf_detection()
+		# Reset detection state for next shelf
+		self._reset_detection_state()
 	
-	def _reset_shelf_detection(self):
-		"""Resets shelf detection state for detecting the next shelf."""
-		self.shelf_detected = False
+	def _reset_detection_state(self):
+		"""Reset all detection state for next shelf."""
+		self.objects_detected = False
+		self.current_objects = None
+		self.objects_detection_time = None
+		self.qr_scanning_enabled = False
 		self.current_shelf_qr = None
-		self.shelf_detection_time = None
-		self.pending_objects = None
-		self.get_logger().info("Shelf processing complete. Ready for next shelf detection.")
+		self.objects_stable_count = 0
+		self.get_logger().info("🔄 Detection state reset. Ready for next shelf.")
 	
-	def check_shelf_object_association(self):
-		"""Periodic check to handle timeouts and orphaned detections."""
+	def check_detection_workflow(self):
+		"""Periodic check to handle timeouts in the new detection workflow."""
 		current_time = self.get_clock().now()
 		
-		# Check if we have a shelf detected but no objects received within timeout
-		if (self.shelf_detected and self.shelf_detection_time and 
-			(current_time - self.shelf_detection_time).nanoseconds / 1e9 > self.shelf_detection_timeout):
-			self.get_logger().warning(f"Timeout: Shelf detected (QR: {self.current_shelf_qr}) but no objects received within {self.shelf_detection_timeout}s")
-			self._reset_shelf_detection()
+		# Check timeout for objects detection
+		if (self.objects_detected and self.objects_detection_time and not self.current_shelf_qr and
+			(current_time - self.objects_detection_time).nanoseconds / 1e9 > self.qr_timeout):
+			obj_list = [f"{name}({count})" for name, count in zip(self.current_objects.object_name, self.current_objects.object_count)]
+			self.get_logger().warning(f"⏰ QR Timeout: Objects detected [{', '.join(obj_list)}] but no QR code found within {self.qr_timeout}s. Resetting.")
+			self._reset_detection_state()
 		
-		# Check if we have pending objects but no shelf confirmation within timeout
-		if (self.pending_objects and self.last_object_detection_time and
-			(current_time - self.last_object_detection_time).nanoseconds / 1e9 > self.object_detection_timeout):
-			obj_list = [f"{name}({count})" for name, count in zip(self.pending_objects.object_name, self.pending_objects.object_count)]
-			self.get_logger().warning(f"Timeout: Objects detected [{', '.join(obj_list)}] but no shelf confirmed within {self.object_detection_timeout}s. Discarding objects.")
-			self.pending_objects = None
+		# Check timeout for object stability
+		if (self.objects_stable_count > 0 and not self.objects_detected and self.last_object_detection_time and
+			(current_time - self.last_object_detection_time).nanoseconds / 1e9 > self.objects_timeout):
+			self.get_logger().warning(f"⏰ Objects Timeout: No stable objects detected within {self.objects_timeout}s. Resetting.")
+			self._reset_detection_state()
 
 	def rover_move_manual_mode(self, speed, turn):
 		"""Operates the rover in manual mode by publishing on /cerebri/in/joy.
@@ -886,27 +963,35 @@ class WarehouseExplore(Node):
 		qr_time_diff = (current_time - self.last_qr_detection_time).nanoseconds / 1e9
 		obj_time_diff = (current_time - self.last_object_detection_time).nanoseconds / 1e9
 		
-		# Shelf status information
-		shelf_status = "No shelf" if not self.shelf_detected else f"Shelf: {self.current_shelf_qr}"
-		pending_status = "" if not self.pending_objects else f", Pending: {len(self.pending_objects.object_name)} objects"
+		# Detection status information
+		if self.objects_detected and self.current_shelf_qr:
+			detection_status = f"Complete: {self.current_shelf_qr}"
+		elif self.objects_detected:
+			detection_status = f"Objects OK, QR waiting"
+		elif self.objects_stable_count > 0:
+			detection_status = f"Objects stabilizing ({self.objects_stable_count}/{self.required_stable_detections})"
+		else:
+			detection_status = "Waiting for objects"
+		
+		qr_status = "Enabled" if self.qr_scanning_enabled else "Disabled"
 		
 		status_msg = (
 			f"Exploration Status - Mode: {self.exploration_mode}, "
 			f"Armed: {self.armed}, "
 			f"Goal Active: {not self.goal_completed}, "
-			f"{shelf_status}{pending_status}, "
-			f"Last QR: {qr_time_diff:.1f}s ago, "
+			f"Detection: {detection_status}, "
+			f"QR Scan: {qr_status}, "
 			f"Last Objects: {obj_time_diff:.1f}s ago, "
 			f"Attempts: {self.exploration_attempts}/{self.max_exploration_attempts}"
 		)
 		
 		self.get_logger().info(status_msg)
 		
-		# Check if we should reset QR code and shelf state if no detection for a while
-		if qr_time_diff > 30.0 and (self.qr_code_str != "Empty" or self.shelf_detected):
+		# Check if we should reset detection state if no object activity for a while
+		if obj_time_diff > 30.0 and (self.objects_detected or self.qr_scanning_enabled):
 			self.qr_code_str = "Empty"
-			self._reset_shelf_detection()
-			self.get_logger().info("Reset QR code and shelf state due to no recent detections")
+			self._reset_detection_state()
+			self.get_logger().info("Reset detection state due to no recent object activity")
 
 	def get_exploration_statistics(self):
 		"""Returns current exploration statistics."""
@@ -916,9 +1001,11 @@ class WarehouseExplore(Node):
 			'max_attempts': self.max_exploration_attempts,
 			'visited_positions': len(self.visited_positions),
 			'current_qr': self.qr_code_str,
-			'shelf_detected': self.shelf_detected,
+			'objects_detected': self.objects_detected,
+			'qr_scanning_enabled': self.qr_scanning_enabled,
 			'current_shelf_qr': self.current_shelf_qr,
-			'pending_objects_count': len(self.pending_objects.object_name) if self.pending_objects else 0,
+			'objects_stable_count': self.objects_stable_count,
+			'current_objects_count': len(self.current_objects.object_name) if self.current_objects else 0,
 			'armed': self.armed,
 			'goal_active': not self.goal_completed
 		}
