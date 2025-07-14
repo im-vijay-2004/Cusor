@@ -118,15 +118,17 @@ ros2 run <package_name> warehouse_explore.py --ros-args -p shelf_count:=5 -p ini
 ## QR Code & Object Detection
 
 ### Shelf Detection Workflow
-The system follows a strict detection sequence to ensure data integrity:
+The system follows a strict detection sequence with intelligent movement control:
 
 1. **🔍 Object Detection First**: AI model detects objects and waits for stability (3 consecutive stable detections)
-2. **✅ Object Confirmation**: Once objects are stable, QR code scanning is enabled
-3. **📱 QR Code Scanning**: System scans for QR codes only after object confirmation
-4. **🔗 Data Association**: QR code is linked with the confirmed objects
-5. **📤 Publication**: Complete shelf data is published when both objects and QR are confirmed
+2. **🐌 Movement Control**: Robot slows down when objects detected but not yet stable
+3. **🛑 Shelf Focus Mode**: Once objects confirmed, robot STOPS exploration entirely and focuses on current shelf
+4. **📱 QR Code Scanning**: System scans for QR codes only after object confirmation
+5. **🔗 Data Association**: QR code is linked with the confirmed objects
+6. **📤 Publication**: Complete shelf data is published when both objects and QR are confirmed
+7. **🚀 Resume Exploration**: Robot exits focus mode and resumes autonomous exploration
 
-**NEW: Objects → QR → Association (not QR → Objects)**
+**KEY: Objects → Movement Stop → QR → Resume (Complete shelf focus)**
 
 ### QR Code Processing
 - Uses OpenCV's built-in QR detector (no libzbar dependency)
@@ -142,12 +144,19 @@ The system follows a strict detection sequence to ensure data integrity:
 - Updates GUI table in real-time
 
 ### Detection States
-- **🔍 Waiting for Objects**: Initial state, scanning for objects
-- **📦 Objects Stabilizing**: Objects detected, waiting for stability (3 consecutive detections)
-- **✅ Objects Confirmed**: Objects stable, QR scanning enabled
-- **📱 QR Scanning**: Looking for QR code to associate with objects
+- **🔍 Waiting for Objects**: Initial state, scanning for objects, normal exploration
+- **🐌 Objects Stabilizing**: Objects detected, robot slowing down, waiting for stability (3 consecutive detections)
+- **🛑 Shelf Focus Mode**: Objects confirmed, **robot stops all exploration**, QR scanning enabled
+- **📱 QR Scanning**: Looking for QR code to associate with confirmed objects
 - **🎉 Shelf Complete**: Both objects and QR confirmed, data published
+- **🚀 Resume Exploration**: Focus mode exited, robot resumes autonomous exploration
 - **🔄 Reset**: Ready for next shelf
+
+### Movement Control States
+- **🤖 Normal Exploration**: Full speed autonomous navigation
+- **🐌 Careful Movement**: Reduced speed when objects detected but not stable
+- **🛑 Complete Stop**: All movement paused during shelf focus mode
+- **🚀 Resume**: Return to normal exploration after shelf completion
 
 ### Testing Mode
 - **🧪 Dummy Mode**: If YOLO model is not available, generates random test objects every 2 seconds
@@ -178,7 +187,7 @@ The system filters detected objects to focus on items typically found on warehou
 
 ## GUI Features
 
-The enhanced GUI provides:
+The enhanced GUI provides intelligent shelf progression:
 - **📋 Header Row**: Shelf numbering (Shelf 1, Shelf 2, etc.)
 - **📦 Object Rows**: Up to 8 object slots per shelf (expandable layout)
 - **📱 QR Row**: QR code display at bottom
@@ -187,19 +196,31 @@ The enhanced GUI provides:
   - Blue = QR code confirmed  
   - Yellow = QR waiting
   - White = Empty slots
+- **📊 Smart Progression**: Automatically moves to next shelf column after completion
+- **🔍 Status Tracking**: Each shelf tracks "empty" → "objects" → "complete" states
+- **⚠️ Bounds Checking**: Prevents GUI errors with proper column management
 - **📊 Real-time Updates**: Live data from both detection nodes
 
-## Error Handling & Recovery
+## Movement Control & Recovery
+
+### Intelligent Movement Control
+- **🤖 Normal Mode**: Full speed autonomous exploration
+- **🐌 Slow Mode**: Reduced speed (30%) when objects detected but unstable
+- **🛑 Focus Mode**: Complete movement stop when shelf confirmed
+- **🚀 Resume Mode**: Return to normal exploration after shelf completion
 
 ### Navigation Recovery
 - Monitors recovery attempts during navigation
-- Cancels stuck goals automatically
+- Cancels stuck goals automatically when entering shelf focus mode
 - Switches exploration modes when needed
+- Prevents irregular movement patterns
 
-### Detection Timeout
-- Resets QR codes after 30 seconds of non-detection
-- Tracks last detection timestamps
-- Provides status logging for debugging
+### Detection Timeout & Safety
+- **Shelf Focus Timeout**: Maximum 30 seconds focusing on one shelf
+- **Object Stability Timeout**: 15 seconds for objects to stabilize
+- **QR Detection Timeout**: 10 seconds to find QR after objects confirmed
+- Automatic state reset and exploration resumption on timeouts
+- Tracks last detection timestamps for debugging
 
 ## Dependencies
 

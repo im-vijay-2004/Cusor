@@ -100,6 +100,10 @@ class WindowProgressTable:
 			qr_box.config(state=tk.DISABLED, bg="lightyellow")
 			qr_box.grid(row=self.max_objects_per_shelf + 1, column=col, padx=2, pady=2, sticky="nsew")
 			self.qr_boxes.append(qr_box)
+		
+		# Track which shelves have been completed
+		self.shelf_status = ["empty"] * self.col_count  # "empty", "objects", "complete"
+		self.current_shelf = 0
 
 		# Make the grid layout responsive
 		for row in range(self.max_objects_per_shelf + 2):  # +2 for header and QR
@@ -120,6 +124,11 @@ class WindowProgressTable:
 	
 	def update_shelf_objects(self, shelf_col, object_list):
 		"""Update all objects for a specific shelf column."""
+		# Ensure we don't exceed available columns
+		if shelf_col >= self.col_count:
+			print(f"Warning: Trying to update shelf {shelf_col}, but only {self.col_count} columns available")
+			return
+			
 		# Clear all object boxes for this shelf
 		for row in range(len(self.boxes)):
 			self.change_box_text(row, shelf_col, "---")
@@ -130,14 +139,40 @@ class WindowProgressTable:
 			if idx < len(self.boxes):
 				self.change_box_text(idx, shelf_col, f"{name}: {count}")
 				self.change_box_color(idx, shelf_col, "lightgreen")
+		
+		# Update shelf status
+		self.shelf_status[shelf_col] = "objects"
+		print(f"Updated shelf {shelf_col} with {len(object_list)} objects")
 	
 	def update_shelf_qr(self, shelf_col, qr_text):
 		"""Update QR code for a specific shelf."""
-		if shelf_col < len(self.qr_boxes):
-			self.qr_boxes[shelf_col].config(state=tk.NORMAL)
-			self.qr_boxes[shelf_col].delete(1.0, tk.END)
-			self.qr_boxes[shelf_col].insert(tk.END, f"QR: {qr_text}")
-			self.qr_boxes[shelf_col].config(state=tk.DISABLED, bg="lightblue")
+		if shelf_col >= len(self.qr_boxes):
+			print(f"Warning: Trying to update QR for shelf {shelf_col}, but only {len(self.qr_boxes)} QR boxes available")
+			return
+			
+		self.qr_boxes[shelf_col].config(state=tk.NORMAL)
+		self.qr_boxes[shelf_col].delete(1.0, tk.END)
+		self.qr_boxes[shelf_col].insert(tk.END, f"QR: {qr_text}")
+		self.qr_boxes[shelf_col].config(state=tk.DISABLED, bg="lightblue")
+		
+		# Update shelf status and move to next shelf
+		self.shelf_status[shelf_col] = "complete"
+		print(f"Completed shelf {shelf_col} with QR: {qr_text}")
+		
+		# Find next available shelf
+		self.current_shelf = self._find_next_available_shelf()
+		print(f"Next available shelf: {self.current_shelf}")
+	
+	def _find_next_available_shelf(self):
+		"""Find the next available shelf column."""
+		for i in range(self.col_count):
+			if self.shelf_status[i] == "empty":
+				return i
+		return 0  # Wrap around if all shelves used
+	
+	def get_current_shelf_column(self):
+		"""Get the current shelf column for new detections."""
+		return self.current_shelf
 
 box_app = None
 def run_gui(shelf_count):
@@ -262,20 +297,24 @@ class WarehouseExplore(Node):
 		self.qr_code_str = "Empty"
 		# Initialize OpenCV QR code detector (detects & decodes without extra dependencies).
 		self.qr_detector = cv2.QRCodeDetector()
-		if PROGRESS_TABLE_GUI:
-			self.table_row_count = 0
-			self.table_col_count = 0
 
 		# --- Shelf Data ---
 		self.shelf_objects_curr = WarehouseShelf()
 		
 		# --- Additional State Management ---
-		self.exploration_mode = "frontier"  # "frontier", "random", "complete"
+		self.exploration_mode = "frontier"  # "frontier", "random", "complete", "shelf_focus"
 		self.last_qr_detection_time = self.get_clock().now()
 		self.last_object_detection_time = self.get_clock().now()
 		self.visited_positions = []  # Track visited positions
 		self.max_exploration_attempts = 50
 		self.exploration_attempts = 0
+		
+		# --- Movement Control ---
+		self.movement_paused = False
+		self.shelf_focus_mode = False
+		self.focus_start_time = None
+		self.max_focus_time = 30.0  # Maximum time to focus on one shelf
+		self.movement_speed_reduction = 0.3  # Slower movement when near shelf
 		
 		# --- NEW Shelf Detection State (Objects FIRST, then QR) ---
 		self.objects_detected = False
@@ -336,6 +375,11 @@ class WarehouseExplore(Node):
 			None
 		"""
 		self.global_map_curr = message
+
+		# STOP exploration if we're focusing on a shelf
+		if self.shelf_focus_mode or self.movement_paused:
+			self.get_logger().debug("🛑 Exploration paused - focusing on shelf")
+			return
 
 		if not self.goal_completed:
 			return
@@ -590,6 +634,10 @@ class WarehouseExplore(Node):
 					obj_list = [f"{name}({count})" for name, count in zip(message.object_name, message.object_count)]
 					self.get_logger().info(f"📦 New objects detected (resetting stability): {', '.join(obj_list)}")
 				
+				# SLOW DOWN movement when objects are being detected (but not full focus yet)
+				if not self.shelf_focus_mode:
+					self._slow_down_for_potential_shelf()
+				
 			else:
 				self.get_logger().debug(f"📦 Too few objects ({len(message.object_name)}) - need at least {self.min_objects_for_shelf}")
 		else:
@@ -620,16 +668,70 @@ class WarehouseExplore(Node):
 		self.objects_detection_time = self.get_clock().now()
 		self.qr_scanning_enabled = True
 		
+		# CRITICAL: Enable shelf focus mode to stop exploration
+		self._enter_shelf_focus_mode()
+		
 		obj_list = [f"{name}({count})" for name, count in zip(objects_message.object_name, objects_message.object_count)]
 		self.get_logger().info(f"✅ OBJECTS CONFIRMED: {', '.join(obj_list)} - QR scanning now ENABLED")
+		self.get_logger().info(f"🎯 SHELF FOCUS MODE: Robot will focus entirely on this shelf")
 		
 		# Update GUI with detected objects
 		if PROGRESS_TABLE_GUI and box_app is not None:
 			try:
+				current_shelf_col = box_app.get_current_shelf_column()
 				object_pairs = list(zip(objects_message.object_name, objects_message.object_count))
-				box_app.update_shelf_objects(self.table_col_count, object_pairs)
+				box_app.update_shelf_objects(current_shelf_col, object_pairs)
+				self.get_logger().info(f"📊 Updated GUI shelf {current_shelf_col} with objects")
 			except Exception as e:
 				self.get_logger().warning(f"GUI update failed: {e}")
+
+	def _enter_shelf_focus_mode(self):
+		"""Enter shelf focus mode - stop exploration and focus on current shelf."""
+		self.shelf_focus_mode = True
+		self.movement_paused = True
+		self.focus_start_time = self.get_clock().now()
+		self.exploration_mode = "shelf_focus"
+		
+		# Cancel any current navigation goal
+		if not self.goal_completed and self.goal_handle_curr is not None:
+			self.get_logger().info("🛑 Cancelling navigation goal to focus on shelf")
+			self.cancel_current_goal()
+			
+		self.get_logger().info("🎯 ENTERED SHELF FOCUS MODE - all movement stopped")
+
+	def _exit_shelf_focus_mode(self):
+		"""Exit shelf focus mode and resume exploration."""
+		self.shelf_focus_mode = False
+		self.movement_paused = False
+		self.focus_start_time = None
+		self.exploration_mode = "frontier"  # Resume normal exploration
+		self.get_logger().info("🚀 EXITED SHELF FOCUS MODE - resuming exploration")
+
+	def _slow_down_for_potential_shelf(self):
+		"""Slow down robot movement when objects are detected but shelf not confirmed yet."""
+		# If robot has an active goal, we can't directly control speed
+		# But we can log that we should be more careful
+		self.get_logger().debug("🐌 Potential shelf detected - robot should move carefully")
+		# Note: In a real implementation, you might want to:
+		# - Reduce navigation goal distances
+		# - Send slower velocity commands
+		# - Increase recovery behaviors patience
+
+	def rover_move_careful(self, speed_multiplier=0.3):
+		"""Move robot more carefully when near potential shelves."""
+		if self.shelf_focus_mode:
+			# Don't move at all in shelf focus mode
+			return
+		
+		# Reduce speed for careful movement
+		careful_speed = 0.2 * speed_multiplier  # Very slow forward movement
+		careful_turn = 0.1 * speed_multiplier   # Very slow turning
+		
+		msg = Joy()
+		msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]
+		msg.axes = [0.0, careful_speed, 0.0, careful_turn]
+		self.publisher_joy.publish(msg)
+		self.get_logger().debug(f"🐌 Careful movement: speed={careful_speed:.2f}, turn={careful_turn:.2f}")
 
 	def _process_complete_shelf(self):
 		"""Process complete shelf when both objects and QR are available."""
@@ -652,12 +754,14 @@ class WarehouseExplore(Node):
 		# Update GUI with QR code
 		if PROGRESS_TABLE_GUI and box_app is not None:
 			try:
-				box_app.update_shelf_qr(self.table_col_count, self.current_shelf_qr)
-				self.table_col_count += 1  # Move to next shelf column
+				current_shelf_col = box_app.get_current_shelf_column()
+				box_app.update_shelf_qr(current_shelf_col, self.current_shelf_qr)
+				self.get_logger().info(f"📊 Updated GUI shelf {current_shelf_col} with QR: {self.current_shelf_qr}")
 			except Exception as e:
 				self.get_logger().warning(f"GUI QR update failed: {e}")
 		
-		# Reset detection state for next shelf
+		# Exit shelf focus mode and reset detection state for next shelf
+		self._exit_shelf_focus_mode()
 		self._reset_detection_state()
 	
 	def _reset_detection_state(self):
@@ -668,11 +772,22 @@ class WarehouseExplore(Node):
 		self.qr_scanning_enabled = False
 		self.current_shelf_qr = None
 		self.objects_stable_count = 0
+		
+		# Also exit shelf focus mode if still active
+		if self.shelf_focus_mode:
+			self._exit_shelf_focus_mode()
+			
 		self.get_logger().info("🔄 Detection state reset. Ready for next shelf.")
 	
 	def check_detection_workflow(self):
 		"""Periodic check to handle timeouts in the new detection workflow."""
 		current_time = self.get_clock().now()
+		
+		# Check shelf focus mode timeout
+		if (self.shelf_focus_mode and self.focus_start_time and
+			(current_time - self.focus_start_time).nanoseconds / 1e9 > self.max_focus_time):
+			self.get_logger().warning(f"⏰ Shelf Focus Timeout: Focused for {self.max_focus_time}s, resuming exploration")
+			self._reset_detection_state()  # This will also exit focus mode
 		
 		# Check timeout for objects detection
 		if (self.objects_detected and self.objects_detection_time and not self.current_shelf_qr and
@@ -699,6 +814,17 @@ class WarehouseExplore(Node):
 		Returns:
 			None
 		"""
+		# Override movement if in shelf focus mode
+		if self.shelf_focus_mode or self.movement_paused:
+			speed = 0.0
+			turn = 0.0
+			self.get_logger().debug("🛑 Movement blocked - shelf focus mode active")
+		elif self.objects_stable_count > 0 and not self.objects_detected:
+			# Slow down when objects are being detected but not confirmed
+			speed = speed * self.movement_speed_reduction
+			turn = turn * self.movement_speed_reduction
+			self.get_logger().debug(f"🐌 Movement reduced - objects stabilizing")
+
 		msg = Joy()
 		msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]
 		msg.axes = [0.0, speed, 0.0, turn]
@@ -974,15 +1100,17 @@ class WarehouseExplore(Node):
 			detection_status = "Waiting for objects"
 		
 		qr_status = "Enabled" if self.qr_scanning_enabled else "Disabled"
+		focus_status = "SHELF FOCUS" if self.shelf_focus_mode else "Exploring"
+		movement_status = "PAUSED" if self.movement_paused else "Active"
 		
 		status_msg = (
-			f"Exploration Status - Mode: {self.exploration_mode}, "
+			f"🤖 Status - Mode: {focus_status}, "
+			f"Movement: {movement_status}, "
 			f"Armed: {self.armed}, "
 			f"Goal Active: {not self.goal_completed}, "
 			f"Detection: {detection_status}, "
 			f"QR Scan: {qr_status}, "
-			f"Last Objects: {obj_time_diff:.1f}s ago, "
-			f"Attempts: {self.exploration_attempts}/{self.max_exploration_attempts}"
+			f"Last Objects: {obj_time_diff:.1f}s ago"
 		)
 		
 		self.get_logger().info(status_msg)
