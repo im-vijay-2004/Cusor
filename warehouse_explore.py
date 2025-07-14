@@ -316,6 +316,18 @@ class WarehouseExplore(Node):
 		self.max_focus_time = 30.0  # Maximum time to focus on one shelf
 		self.movement_speed_reduction = 0.3  # Slower movement when near shelf
 		
+		# --- Orbital Movement for Shelf Detection ---
+		self.orbital_mode = False
+		self.orbital_center = None  # Center point around which to orbit
+		self.orbital_radius = 1.5  # Meters from shelf center
+		self.orbital_angle = 0.0  # Current orbital angle
+		self.orbital_speed = 0.15  # Linear speed during orbital movement
+		self.orbital_angular_speed = 0.3  # Angular speed during orbital movement
+		self.orbital_start_time = None
+		self.max_orbital_time = 45.0  # Maximum time for orbital movement
+		self.expected_objects_count = 6  # Expected objects on a shelf
+		self.orbital_detection_timer = None
+		
 		# --- NEW Shelf Detection State (Objects FIRST, then QR) ---
 		self.objects_detected = False
 		self.current_objects = None
@@ -686,9 +698,9 @@ class WarehouseExplore(Node):
 				self.get_logger().warning(f"GUI update failed: {e}")
 
 	def _enter_shelf_focus_mode(self):
-		"""Enter shelf focus mode - stop exploration and focus on current shelf."""
+		"""Enter shelf focus mode - start orbital movement around shelf."""
 		self.shelf_focus_mode = True
-		self.movement_paused = True
+		self.movement_paused = False  # Don't pause movement, use orbital instead
 		self.focus_start_time = self.get_clock().now()
 		self.exploration_mode = "shelf_focus"
 		
@@ -696,8 +708,10 @@ class WarehouseExplore(Node):
 		if not self.goal_completed and self.goal_handle_curr is not None:
 			self.get_logger().info("🛑 Cancelling navigation goal to focus on shelf")
 			self.cancel_current_goal()
-			
-		self.get_logger().info("🎯 ENTERED SHELF FOCUS MODE - all movement stopped")
+		
+		# Start orbital movement around the current position
+		self._start_orbital_movement()
+		self.get_logger().info("🎯 ENTERED SHELF FOCUS MODE - starting orbital movement")
 
 	def _exit_shelf_focus_mode(self):
 		"""Exit shelf focus mode and resume exploration."""
@@ -705,6 +719,9 @@ class WarehouseExplore(Node):
 		self.movement_paused = False
 		self.focus_start_time = None
 		self.exploration_mode = "frontier"  # Resume normal exploration
+		
+		# Stop orbital movement
+		self._stop_orbital_movement()
 		self.get_logger().info("🚀 EXITED SHELF FOCUS MODE - resuming exploration")
 
 	def _slow_down_for_potential_shelf(self):
@@ -720,7 +737,7 @@ class WarehouseExplore(Node):
 	def rover_move_careful(self, speed_multiplier=0.3):
 		"""Move robot more carefully when near potential shelves."""
 		if self.shelf_focus_mode:
-			# Don't move at all in shelf focus mode
+			# Don't move at all in shelf focus mode - orbital movement handles this
 			return
 		
 		# Reduce speed for careful movement
@@ -732,6 +749,144 @@ class WarehouseExplore(Node):
 		msg.axes = [0.0, careful_speed, 0.0, careful_turn]
 		self.publisher_joy.publish(msg)
 		self.get_logger().debug(f"🐌 Careful movement: speed={careful_speed:.2f}, turn={careful_turn:.2f}")
+
+	def _start_orbital_movement(self):
+		"""Start orbital movement around the current position."""
+		if self.pose_curr is None:
+			self.get_logger().warning("⚠️  Cannot start orbital movement - no pose available")
+			return
+			
+		# Use current position as the center of orbit
+		self.orbital_center = (self.buggy_pose_x, self.buggy_pose_y)
+		self.orbital_mode = True
+		self.orbital_angle = 0.0
+		self.orbital_start_time = self.get_clock().now()
+		
+		# Create a timer for orbital movement execution
+		if self.orbital_detection_timer is not None:
+			self.orbital_detection_timer.cancel()
+		self.orbital_detection_timer = self.create_timer(0.1, self._orbital_movement_step)
+		
+		self.get_logger().info(f"🌀 Starting orbital movement around point ({self.orbital_center[0]:.2f}, {self.orbital_center[1]:.2f})")
+
+	def _stop_orbital_movement(self):
+		"""Stop orbital movement."""
+		self.orbital_mode = False
+		self.orbital_center = None
+		self.orbital_start_time = None
+		
+		if self.orbital_detection_timer is not None:
+			self.orbital_detection_timer.cancel()
+			self.orbital_detection_timer = None
+			
+		# Stop the robot
+		msg = Joy()
+		msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]
+		msg.axes = [0.0, 0.0, 0.0, 0.0]
+		self.publisher_joy.publish(msg)
+		
+		self.get_logger().info("🛑 Stopped orbital movement")
+
+	def _orbital_movement_step(self):
+		"""Execute one step of orbital movement."""
+		if not self.orbital_mode or self.orbital_center is None:
+			return
+			
+		# Check timeout
+		current_time = self.get_clock().now()
+		if (self.orbital_start_time and 
+			(current_time - self.orbital_start_time).nanoseconds / 1e9 > self.max_orbital_time):
+			self.get_logger().warning(f"⏰ Orbital movement timeout after {self.max_orbital_time}s")
+			self._complete_orbital_detection()
+			return
+			
+		# Check if we have enough objects detected
+		if (self.current_objects and 
+			len(self.current_objects.object_name) >= self.expected_objects_count):
+			self.get_logger().info(f"✅ All {self.expected_objects_count} objects detected! Stopping orbital movement")
+			self._complete_orbital_detection()
+			return
+			
+		# Continue orbital movement
+		self._execute_orbital_movement()
+
+	def _execute_orbital_movement(self):
+		"""Execute orbital movement around the shelf."""
+		if not self.orbital_mode or self.orbital_center is None or self.pose_curr is None:
+			return
+			
+		# Calculate desired position on the orbit
+		self.orbital_angle += self.orbital_angular_speed * 0.1  # 0.1s timer interval
+		if self.orbital_angle > 2 * math.pi:
+			self.orbital_angle -= 2 * math.pi
+			
+		desired_x = self.orbital_center[0] + self.orbital_radius * math.cos(self.orbital_angle)
+		desired_y = self.orbital_center[1] + self.orbital_radius * math.sin(self.orbital_angle)
+		
+		# Calculate movement towards desired position
+		current_x = self.buggy_pose_x
+		current_y = self.buggy_pose_y
+		
+		dx = desired_x - current_x
+		dy = desired_y - current_y
+		distance_to_target = math.sqrt(dx*dx + dy*dy)
+		
+		# Calculate desired orientation (facing the shelf center)
+		angle_to_center = math.atan2(self.orbital_center[1] - current_y, 
+									self.orbital_center[0] - current_x)
+		
+		# Get current orientation
+		current_orientation = self._get_current_yaw()
+		
+		# Calculate turn command
+		angle_diff = angle_to_center - current_orientation
+		# Normalize angle difference to [-pi, pi]
+		while angle_diff > math.pi:
+			angle_diff -= 2 * math.pi
+		while angle_diff < -math.pi:
+			angle_diff += 2 * math.pi
+			
+		# Calculate movement commands
+		speed = min(self.orbital_speed, distance_to_target * 2.0)  # Proportional speed
+		turn = max(-1.0, min(1.0, angle_diff * 2.0))  # Proportional turn
+		
+		# Apply movement
+		msg = Joy()
+		msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]
+		msg.axes = [0.0, speed, 0.0, turn]
+		self.publisher_joy.publish(msg)
+		
+		self.get_logger().debug(f"🌀 Orbital: angle={self.orbital_angle:.2f}, "
+							   f"target=({desired_x:.2f},{desired_y:.2f}), "
+							   f"speed={speed:.2f}, turn={turn:.2f}")
+
+	def _get_current_yaw(self):
+		"""Get current yaw angle from pose."""
+		if self.pose_curr is None:
+			return 0.0
+			
+		# Convert quaternion to yaw
+		orientation = self.pose_curr.pose.pose.orientation
+		siny_cosp = 2 * (orientation.w * orientation.z + orientation.x * orientation.y)
+		cosy_cosp = 1 - 2 * (orientation.y * orientation.y + orientation.z * orientation.z)
+		yaw = math.atan2(siny_cosp, cosy_cosp)
+		return yaw
+
+	def _complete_orbital_detection(self):
+		"""Complete the orbital detection phase and proceed with QR scanning."""
+		self._stop_orbital_movement()
+		
+		if self.current_objects and len(self.current_objects.object_name) > 0:
+			# Mark objects as detected and enable QR scanning
+			self.objects_detected = True
+			self.objects_detection_time = self.get_clock().now()
+			self.qr_scanning_enabled = True
+			
+			obj_summary = [f"{name}({count})" for name, count in zip(self.current_objects.object_name, self.current_objects.object_count)]
+			self.get_logger().info(f"🎯 Orbital detection complete! Objects: [{', '.join(obj_summary)}] - Enabling QR scanning")
+		else:
+			self.get_logger().warning("⚠️  Orbital detection complete but no objects found")
+			self._reset_detection_state()
 
 	def _process_complete_shelf(self):
 		"""Process complete shelf when both objects and QR are available."""
@@ -773,6 +928,10 @@ class WarehouseExplore(Node):
 		self.current_shelf_qr = None
 		self.objects_stable_count = 0
 		
+		# Stop orbital movement if active
+		if self.orbital_mode:
+			self._stop_orbital_movement()
+		
 		# Also exit shelf focus mode if still active
 		if self.shelf_focus_mode:
 			self._exit_shelf_focus_mode()
@@ -783,8 +942,8 @@ class WarehouseExplore(Node):
 		"""Periodic check to handle timeouts in the new detection workflow."""
 		current_time = self.get_clock().now()
 		
-		# Check shelf focus mode timeout
-		if (self.shelf_focus_mode and self.focus_start_time and
+		# Check shelf focus mode timeout (but not during orbital movement which has its own timeout)
+		if (self.shelf_focus_mode and self.focus_start_time and not self.orbital_mode and
 			(current_time - self.focus_start_time).nanoseconds / 1e9 > self.max_focus_time):
 			self.get_logger().warning(f"⏰ Shelf Focus Timeout: Focused for {self.max_focus_time}s, resuming exploration")
 			self._reset_detection_state()  # This will also exit focus mode
@@ -814,11 +973,14 @@ class WarehouseExplore(Node):
 		Returns:
 			None
 		"""
-		# Override movement if in shelf focus mode
-		if self.shelf_focus_mode or self.movement_paused:
+		# Handle orbital movement when in shelf focus mode
+		if self.shelf_focus_mode and self.orbital_mode:
+			self._execute_orbital_movement()
+			return
+		elif self.movement_paused:
 			speed = 0.0
 			turn = 0.0
-			self.get_logger().debug("🛑 Movement blocked - shelf focus mode active")
+			self.get_logger().debug("🛑 Movement blocked - movement paused")
 		elif self.objects_stable_count > 0 and not self.objects_detected:
 			# Slow down when objects are being detected but not confirmed
 			speed = speed * self.movement_speed_reduction
@@ -1100,8 +1262,18 @@ class WarehouseExplore(Node):
 			detection_status = "Waiting for objects"
 		
 		qr_status = "Enabled" if self.qr_scanning_enabled else "Disabled"
-		focus_status = "SHELF FOCUS" if self.shelf_focus_mode else "Exploring"
+		if self.shelf_focus_mode and self.orbital_mode:
+			focus_status = "ORBITAL DETECTION"
+		elif self.shelf_focus_mode:
+			focus_status = "SHELF FOCUS"
+		else:
+			focus_status = "Exploring"
 		movement_status = "PAUSED" if self.movement_paused else "Active"
+		
+		orbital_info = ""
+		if self.orbital_mode and self.current_objects:
+			current_obj_count = len(self.current_objects.object_name)
+			orbital_info = f", Orbital Objects: {current_obj_count}/{self.expected_objects_count}"
 		
 		status_msg = (
 			f"🤖 Status - Mode: {focus_status}, "
@@ -1110,7 +1282,7 @@ class WarehouseExplore(Node):
 			f"Goal Active: {not self.goal_completed}, "
 			f"Detection: {detection_status}, "
 			f"QR Scan: {qr_status}, "
-			f"Last Objects: {obj_time_diff:.1f}s ago"
+			f"Last Objects: {obj_time_diff:.1f}s ago{orbital_info}"
 		)
 		
 		self.get_logger().info(status_msg)
