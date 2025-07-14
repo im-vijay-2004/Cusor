@@ -70,15 +70,31 @@ ros2 run <package_name> warehouse_explore.py --ros-args -p shelf_count:=5 -p ini
 
 ## QR Code & Object Detection
 
+### Shelf Detection Workflow
+The node follows a strict detection sequence to ensure data integrity:
+
+1. **Shelf Detection First**: QR code detection indicates shelf presence
+2. **Object Processing**: Objects are only processed after shelf confirmation
+3. **Data Association**: Objects are linked with the shelf's QR code
+4. **Publication**: Complete shelf data is published only when both are confirmed
+
 ### QR Code Processing
 - Uses OpenCV's built-in QR detector (no libzbar dependency)
+- QR detection triggers shelf detection state
 - Updates detection timestamps
 - Resets QR data after extended non-detection periods
 
 ### Object Data Publishing
-- Combines detected objects with current QR code
-- Publishes to `/shelf_data` for evaluation
+- **Conditional Processing**: Objects are only processed if a shelf is detected first
+- **Temporal Buffering**: Objects detected before shelf confirmation are temporarily stored
+- **Timeout Handling**: Orphaned objects or shelves are discarded after timeout periods
+- **Complete Data**: Publishes shelf data only when both QR code and objects are confirmed
 - Updates GUI table in real-time
+
+### Detection States
+- **No Shelf**: Waiting for QR code detection
+- **Shelf Detected**: QR code found, waiting for or processing objects
+- **Processing Complete**: Shelf data published, ready for next shelf
 
 ## GUI Features
 
@@ -142,7 +158,9 @@ The node provides periodic status updates including:
 - `max_exploration_attempts`: Total exploration limit
 
 ### Detection Settings
-- QR timeout duration
+- `shelf_detection_timeout`: Time to wait for objects after shelf detection (default: 5.0s)
+- `object_detection_timeout`: Time to wait for shelf confirmation after objects (default: 10.0s) 
+- QR timeout duration (30s for automatic reset)
 - Object detection processing logic
 - GUI update behavior
 
