@@ -1,7 +1,17 @@
-# ROS2 Warehouse Exploration Node Dependencies
+# ROS2 Warehouse Exploration & Object Recognition Dependencies
 rclpy
 numpy>=1.21.0
 opencv-python>=4.5.0
 scipy>=1.7.0
 scikit-learn>=1.0.0
+
+# Object Recognition Dependencies
+torch>=1.12.0
+torchvision>=0.13.0
+PyYAML>=6.0
+tflite-runtime>=2.10.0  # or tensorflow-lite
+
+# Optional performance enhancements
+# pkg-resources  # Usually available by default
+
 # Note: ROS2 message packages (sensor_msgs, geometry_msgs, etc.) are typically installed via rosdep
